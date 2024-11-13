@@ -2,18 +2,122 @@
 import requests
 import random
 import torch
+import time
 from typing import Dict, List, Tuple, Set, Optional
+from collections import deque
+
+
+class PublicTestEnvironment:
+    """公开Web测试环境"""
+
+    def __init__(self):
+        self.test_environments = {
+            'httpbin': {
+                'base_url': 'http://httpbin.org',
+                'setup_required': False,
+                'rate_limit': 1.0,
+                'max_requests': 100
+            }
+        }
+
+        self.safe_endpoints = {
+            'httpbin': [
+                '/get',
+                '/post',
+                '/headers',
+                '/cookies',
+                '/anything',
+                '/status/200'
+            ]
+        }
+
+        self.current_env = None
+        self.request_count = 0
+        self.last_request_time = 0
+        self.coverage_history = set()
+
+    def respect_rate_limit(self):
+        """遵守速率限制"""
+        if self.current_env:
+            rate_limit = self.test_environments[self.current_env]['rate_limit']
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            if time_since_last < rate_limit:
+                time.sleep(rate_limit - time_since_last)
+            self.last_request_time = time.time()
+
+    async def get_test_url(self, env_name: str = 'httpbin') -> Optional[str]:
+        """获取测试URL"""
+        if env_name not in self.test_environments:
+            print(f"不支持的测试环境: {env_name}")
+            return None
+
+        self.current_env = env_name
+        return self.test_environments[env_name]['base_url']
+
+    def get_safe_endpoints(self) -> List[str]:
+        """获取安全的测试端点"""
+        if not self.current_env:
+            return []
+        return self.safe_endpoints.get(self.current_env, [])
+
+    def can_make_request(self) -> bool:
+        """检查是否可以发送请求"""
+        if not self.current_env:
+            return False
+        max_requests = self.test_environments[self.current_env]['max_requests']
+        return self.request_count < max_requests
+
+    async def make_request(self, method: str, url: str, params: dict = None,
+                           headers: dict = None, data: dict = None) -> Optional[requests.Response]:
+        """发送HTTP请求"""
+        if not self.can_make_request():
+            return None
+
+        self.respect_rate_limit()
+
+        try:
+            default_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/json',
+                'Connection': 'keep-alive'
+            }
+            if headers:
+                default_headers.update(headers)
+
+            response = requests.request(
+                method=method,
+                url=url,
+                params=params,
+                headers=default_headers,
+                data=data,
+                timeout=10,
+                verify=False,
+                allow_redirects=True
+            )
+
+            self.request_count += 1
+
+            # 记录覆盖率信息
+            coverage_key = f"{response.status_code}_{len(response.content)}"
+            self.coverage_history.add(coverage_key)
+
+            return response
+
+        except Exception as e:
+            print(f"请求失败: {str(e)}")
+            return None
 
 
 class WebFuzzingEnvironment:
-    def __init__(self, target_url: str):
-        """
-        初始化Web Fuzzing环境
+    """Web Fuzzing环境"""
 
-        Args:
-            target_url (str): 目标URL
-        """
-        self.target_url = target_url
+    def __init__(self, test_env: PublicTestEnvironment):
+        self.test_env = test_env
+        self.current_state = self.get_initial_state()
+        self.state_dim = 7  # 状态向量维度
+        self.action_dim = 6  # 动作空间维度
+
         self.mutation_types = [
             'change_param_value',
             'add_param',
@@ -22,18 +126,9 @@ class WebFuzzingEnvironment:
             'add_header',
             'modify_content_type'
         ]
-        self.current_state = self.get_initial_state()
-        self.coverage_history: Set[str] = set()
-        self.state_dim = 7  # 状态向量维度
-        self.action_dim = len(self.mutation_types)
 
     def get_initial_state(self) -> Dict:
-        """
-        获取初始状态
-
-        Returns:
-            Dict: 初始HTTP请求状态
-        """
+        """获取初始状态"""
         return {
             'method': 'GET',
             'params': {},
@@ -45,26 +140,12 @@ class WebFuzzingEnvironment:
         }
 
     def reset(self) -> torch.FloatTensor:
-        """
-        重置环境状态
-
-        Returns:
-            torch.FloatTensor: 初始状态向量
-        """
+        """重置环境"""
         self.current_state = self.get_initial_state()
-        self.coverage_history.clear()
         return self.state_to_vector(self.current_state)
 
     def state_to_vector(self, state: Dict) -> torch.FloatTensor:
-        """
-        将状态转换为向量表示
-
-        Args:
-            state (Dict): HTTP请求状态
-
-        Returns:
-            torch.FloatTensor: 状态向量
-        """
+        """状态向量化"""
         method_encoding = [1 if state['method'] == m else 0
                            for m in ['GET', 'POST', 'PUT', 'DELETE']]
         param_count = len(state['params'])
@@ -73,237 +154,92 @@ class WebFuzzingEnvironment:
 
         return torch.FloatTensor(method_encoding + [param_count, header_count, has_body])
 
-    def step(self, action: int) -> Tuple[torch.FloatTensor, float, bool, Dict]:
-        """
-        执行一步动作
-
-        Args:
-            action (int): 动作索引
-
-        Returns:
-            Tuple: (下一个状态, 奖励, 是否结束, 信息字典)
-        """
+    async def step(self, action: int) -> Tuple[torch.FloatTensor, float, bool, Dict]:
+        """执行一步动作"""
         mutation_type = self.mutation_types[action]
         new_state = self.mutate_state(self.current_state, mutation_type)
-        response = self.execute_request(new_state)
 
-        # 计算新的覆盖率和奖励
-        new_coverage = False
-        if response:
-            coverage_key = f"{response.status_code}_{len(response.content)}"
-            if coverage_key not in self.coverage_history:
-                new_coverage = True
-                self.coverage_history.add(coverage_key)
+        endpoint = random.choice(self.test_env.get_safe_endpoints())
+        base_url = await self.test_env.get_test_url()
 
-        reward = self.calculate_reward(response, new_coverage)
-        done = len(self.coverage_history) >= 100  # 可以根据需要调整终止条件
+        if not base_url:
+            return self.state_to_vector(new_state), -1, True, {}
+
+        url = f"{base_url}{endpoint}"
+
+        response = await self.test_env.make_request(
+            method=new_state['method'],
+            url=url,
+            params=new_state['params'],
+            headers=new_state['headers'],
+            data=new_state['body']
+        )
+
+        reward = self.calculate_reward(response)
+        done = not self.test_env.can_make_request()
 
         self.current_state = new_state
         info = {
-            'coverage_count': len(self.coverage_history),
+            'coverage_count': len(self.test_env.coverage_history),
             'response_status': response.status_code if response else None,
             'mutation_type': mutation_type
         }
 
         return self.state_to_vector(new_state), reward, done, info
 
-    def mutate_state(self, state: Dict, action_type: str) -> Dict:
-        """
-        根据动作类型修改状态
-
-        Args:
-            state (Dict): 当前状态
-            action_type (str): 动作类型
-
-        Returns:
-            Dict: 新状态
-        """
+    def mutate_state(self, state: Dict, mutation_type: str) -> Dict:
+        """状态变异"""
         new_state = state.copy()
 
-        if action_type == 'change_param_value':
+        if mutation_type == 'change_param_value':
             if new_state['params']:
                 param = random.choice(list(new_state['params'].keys()))
-                new_state['params'][param] = self._generate_random_value()
+                new_state['params'][param] = str(random.randint(1, 1000))
 
-        elif action_type == 'add_param':
+        elif mutation_type == 'add_param':
             new_param = f"param_{random.randint(1, 1000)}"
-            new_state['params'][new_param] = self._generate_random_value()
+            new_state['params'][new_param] = str(random.randint(1, 1000))
 
-        elif action_type == 'remove_param':
+        elif mutation_type == 'remove_param':
             if new_state['params']:
                 param = random.choice(list(new_state['params'].keys()))
                 del new_state['params'][param]
 
-        elif action_type == 'change_method':
-            methods = ['GET', 'POST', 'PUT', 'DELETE']
+        elif mutation_type == 'change_method':
+            methods = ['GET', 'POST']
             new_state['method'] = random.choice(methods)
 
-        elif action_type == 'add_header':
-            headers = [
-                'X-Forwarded-For',
-                'X-Custom-Header',
-                'Accept-Encoding',
-                'X-Requested-With',
-                'Origin',
-                'Referer'
-            ]
-            new_header = random.choice(headers)
-            new_state['headers'][new_header] = self._generate_random_value()
+        elif mutation_type == 'add_header':
+            safe_headers = ['Accept', 'Accept-Language', 'Accept-Encoding']
+            new_header = random.choice(safe_headers)
+            new_state['headers'][new_header] = 'test-value'
 
-        elif action_type == 'modify_content_type':
+        elif mutation_type == 'modify_content_type':
             content_types = [
                 'application/json',
                 'application/x-www-form-urlencoded',
-                'multipart/form-data',
-                'text/plain',
-                'application/xml',
-                'text/html'
+                'text/plain'
             ]
             new_state['headers']['Content-Type'] = random.choice(content_types)
 
         return new_state
 
-    def _generate_random_value(self) -> str:
-        """
-        生成随机测试值
+    def calculate_reward(self, response: Optional[requests.Response]) -> float:
+        """计算奖励"""
+        if not response:
+            return -1
 
-        Returns:
-            str: 生成的测试值
-        """
-        value_types = ['normal', 'sql_injection', 'xss', 'path_traversal', 'command_injection']
-        value_type = random.choice(value_types)
-
-        if value_type == 'normal':
-            return str(random.randint(1, 1000))
-        elif value_type == 'sql_injection':
-            payloads = [
-                "' OR '1'='1",
-                "'; DROP TABLE users;--",
-                "' UNION SELECT * FROM users;--",
-                "admin' --",
-                "1' OR '1' = '1",
-                "1; DROP TABLE users--",
-                "' OR 1=1#",
-                "' OR 'x'='x"
-            ]
-            return random.choice(payloads)
-        elif value_type == 'xss':
-            payloads = [
-                '<script>alert(1)</script>',
-                '"><img src=x onerror=alert(1)>',
-                '<img src=x onerror=alert(1)>',
-                '"><svg/onload=alert(1)>',
-                '<svg/onload=alert(1)>',
-                'javascript:alert(1)//',
-                '<img src="x" onerror="alert(1)">',
-                '<body onload=alert(1)>'
-            ]
-            return random.choice(payloads)
-        elif value_type == 'path_traversal':
-            payloads = [
-                '../../../etc/passwd',
-                '..\\..\\..\\windows\\system32\\config\\SAM',
-                '....//....//....//etc/passwd',
-                '..%2F..%2F..%2Fetc%2Fpasswd',
-                '..%252F..%252F..%252Fetc%252Fpasswd',
-                '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd'
-            ]
-            return random.choice(payloads)
-        else:  # command_injection
-            payloads = [
-                '; ls -la',
-                '| dir',
-                '`cat /etc/passwd`',
-                '$(cat /etc/passwd)',
-                '; ping -c 4 127.0.0.1',
-                '| whoami',
-                '; echo vulnerable'
-            ]
-            return random.choice(payloads)
-
-    def execute_request(self, state: Dict) -> Optional[requests.Response]:
-        """
-        执行HTTP请求
-
-        Args:
-            state (Dict): 请求状态
-
-        Returns:
-            Optional[requests.Response]: 请求响应对象，失败时返回None
-        """
-        try:
-            if state['method'] in ['GET', 'DELETE']:
-                response = requests.request(
-                    state['method'],
-                    self.target_url,
-                    params=state['params'],
-                    headers=state['headers'],
-                    timeout=5
-                )
-            else:
-                response = requests.request(
-                    state['method'],
-                    self.target_url,
-                    params=state['params'],
-                    headers=state['headers'],
-                    data=state['body'],
-                    timeout=5
-                )
-
-            return response
-        except Exception as e:
-            return None
-
-    def calculate_reward(self, response: Optional[requests.Response], new_coverage: bool) -> float:
-        """
-        计算奖励值
-
-        Args:
-            response (Optional[requests.Response]): 请求响应
-            new_coverage (bool): 是否发现新的覆盖路径
-
-        Returns:
-            float: 奖励值
-        """
         reward = 0
 
-        if response is None:
-            return -1  # 请求失败的惩罚
-
-        # 新覆盖路径奖励
-        if new_coverage:
-            reward += 10
-
-        # 响应状态码奖励
-        if 500 <= response.status_code < 600:  # 服务器错误可能表示发现了漏洞
-            reward += 20
-        elif 400 <= response.status_code < 500:  # 客户端错误可能表示发现了有趣的边界情况
-            reward += 5
-        elif response.status_code == 200:  # 成功响应
+        # 基础奖励
+        if 200 <= response.status_code < 300:
             reward += 1
+        elif 400 <= response.status_code < 500:
+            reward += 0.5
 
-        # 响应内容相关奖励
-        if 'error' in response.text.lower() or 'exception' in response.text.lower():
+        # 覆盖率奖励
+        coverage_key = f"{response.status_code}_{len(response.content)}"
+        if coverage_key not in self.test_env.coverage_history:
             reward += 5
 
         return reward
-
-    @property
-    def observation_space_dim(self) -> int:
-        """
-        获取观察空间维度
-
-        Returns:
-            int: 状态向量维度
-        """
-        return self.state_dim
-
-    @property
-    def action_space_dim(self) -> int:
-        """
-        获取动作空间维度
-
-        Returns:
-            int: 动作空间维度
-        """
-        return self.action_dim
